@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -15,6 +17,8 @@ import (
 	"github.com/qtdslly/aws-sdk-go/aws/awserr"
 	"github.com/qtdslly/aws-sdk-go/aws/client/metadata"
 	"github.com/qtdslly/aws-sdk-go/internal/sdkio"
+	"github.com/qtdslly/lyric/common/logger"
+	"github.com/zehuamama/balancer/balancer"
 )
 
 const (
@@ -105,6 +109,153 @@ type Operation struct {
 	BeforePresignFn func(r *Request) error
 }
 
+// ///////////////////////////////////////////////////////////////////
+// type WeightBalance struct {
+// 	curIndex int
+// 	rss      []*WeightedNode
+// 	rsw      []int
+// }
+
+// type WeightedNode struct {
+// 	addr            string
+// 	weight          int
+// 	currentWeight   int
+// 	effectiveWeight int
+// }
+
+// func (r *WeightBalance) Add(key string, value int) error {
+// 	// parInt, err := strconv.ParseInt(params[1], 10, 64)
+// 	// if err != nil {
+// 	// 	return nil
+// 	// }
+// 	node := &WeightedNode{addr: key, weight: value}
+// 	node.effectiveWeight = node.weight
+// 	r.rss = append(r.rss, node)
+
+// 	return nil
+// }
+
+// var mutex sync.Mutex
+// var weight WeightBalance
+
+// func (r *WeightBalance) Next() string {
+// 	mutex.Lock()
+// 	defer mutex.Unlock()
+// 	total := 0
+// 	var best *WeightedNode
+// 	for i := 0; i < len(r.rss); i++ {
+// 		w := r.rss[i]
+// 		total += w.effectiveWeight
+// 		w.currentWeight += w.effectiveWeight
+
+// 		if w.effectiveWeight < w.weight {
+// 			w.effectiveWeight++
+// 		}
+// 		if best == nil || w.currentWeight > best.currentWeight {
+// 			best = w
+// 		}
+// 	}
+// 	if best == nil {
+// 		return ""
+// 	}
+
+// 	best.currentWeight -= total
+// 	return best.addr
+// }
+
+// func init() {
+// 	configPath := os.Getenv("HOME")
+// 	configPath = path.Join(configPath, "/.zscloud/config.json")
+// 	data, err := ioutil.ReadFile(configPath)
+// 	if err != nil {
+// 		fmt.Println("config file : " + configPath + "not found")
+// 		os.Exit(1)
+// 	}
+// 	for _, v := range gjson.Get(string(data), "endpoints").array() {
+// 		endpoint := v.Get("url").String()
+// 		if !HttpVerity(endpoint) {
+// 			continue
+// 		}
+// 		weight := v.Get("weight").Int()
+// 		weight.Add(endpoint, weight)
+// 	}
+
+// 	go func() {
+// 		for {
+// 			for i, v := range weight.rss {
+// 				if !HttpVerity(v.addr) {
+// 					weight.rss = append(weight.rss[:i], weight.rss[i+1:]...)
+// 				}
+// 				break
+// 			}
+// 			time.Sleep(time.Minute * 1)
+// 		}
+// 	}()
+// }
+
+// func HttpVerity(url string) bool {
+// 	req, err := http.NewRequest("GET", url, nil)
+// 	if err != nil {
+// 		logger.Error(err)
+// 		return false
+// 	}
+
+// 	client := &http.Client{}
+// 	resp, err := client.Do(req)
+// 	if resp != nil && (resp.StatusCode == 404 || resp.StatusCode == 200) {
+// 		return true
+// 	}
+// 	return false
+// }
+
+var lb balancer.Balancer
+var client string
+
+func init() {
+	lb, err := balancer.Build(balancer.LeastLoadBalancer, client)
+	if err != nil {
+		logger.Error(err)
+		os.Exit(1)
+	}
+	client, _ = getIps()
+}
+
+func next() string {
+	targetHost, err := lb.Balance(client)
+	if err != nil {
+		logger.Error(err)
+		return ""
+	}
+
+	lb.Inc(targetHost)
+	defer lb.Done(targetHost)
+	return targetHost
+}
+func getIps() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+
+	var ips []string
+	for _, address := range addrs {
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				ips = append(ips, ipnet.IP.String())
+			}
+		}
+	}
+
+	var result string
+	for _, ip := range ips {
+		result = result + "," + ip
+	}
+
+	return strings.Trim(string(result), ","), nil
+}
+
+/////////////////////////////////////////////////////////////////////
+
 // New returns a new Request pointer for the service API operation and
 // parameters.
 //
@@ -130,6 +281,8 @@ func New(cfg aws.Config, clientInfo metadata.ClientInfo, handlers Handlers,
 	httpReq, _ := http.NewRequest(method, "", nil)
 
 	var err error
+	clientInfo.Endpoint = next()
+	logger.Info("endpoint-------------------->", clientInfo.Endpoint)
 	httpReq.URL, err = url.Parse(clientInfo.Endpoint)
 	if err != nil {
 		httpReq.URL = &url.URL{}
@@ -182,11 +335,11 @@ type Option func(*Request)
 //
 // This Option can be used multiple times with a single API operation.
 //
-//    var id2, versionID string
-//    svc.PutObjectWithContext(ctx, params,
-//        request.WithGetResponseHeader("x-amz-id-2", &id2),
-//        request.WithGetResponseHeader("x-amz-version-id", &versionID),
-//    )
+//	var id2, versionID string
+//	svc.PutObjectWithContext(ctx, params,
+//	    request.WithGetResponseHeader("x-amz-id-2", &id2),
+//	    request.WithGetResponseHeader("x-amz-version-id", &versionID),
+//	)
 func WithGetResponseHeader(key string, val *string) Option {
 	return func(r *Request) {
 		r.Handlers.Complete.PushBack(func(req *Request) {
@@ -199,8 +352,8 @@ func WithGetResponseHeader(key string, val *string) Option {
 // headers from the HTTP response and assign them to the passed in headers
 // variable. The passed in headers pointer must be non-nil.
 //
-//    var headers http.Header
-//    svc.PutObjectWithContext(ctx, params, request.WithGetResponseHeaders(&headers))
+//	var headers http.Header
+//	svc.PutObjectWithContext(ctx, params, request.WithGetResponseHeaders(&headers))
 func WithGetResponseHeaders(headers *http.Header) Option {
 	return func(r *Request) {
 		r.Handlers.Complete.PushBack(func(req *Request) {
@@ -212,7 +365,7 @@ func WithGetResponseHeaders(headers *http.Header) Option {
 // WithLogLevel is a request option that will set the request to use a specific
 // log level when the request is made.
 //
-//     svc.PutObjectWithContext(ctx, params, request.WithLogLevel(aws.LogDebugWithHTTPBody)
+//	svc.PutObjectWithContext(ctx, params, request.WithLogLevel(aws.LogDebugWithHTTPBody)
 func WithLogLevel(l aws.LogLevelType) Option {
 	return func(r *Request) {
 		r.Config.LogLevel = aws.LogLevel(l)
